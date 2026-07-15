@@ -1,0 +1,267 @@
+MATLAB script used for image processing and quantification is provided below.
+% LIVE/DEAD ASSAY ANALYSIS
+% Compatible with filenames like:
+% D1 HM1 R1_Overlay.tif
+% D2 HF3 R2_Overlay.tiff
+% D3 PM2 R3_Overlay.jpg
+clear; clc; close all;
+%% ========================= SELECT MAIN FOLDER ==========================
+mainFolder = uigetdir(pwd, 'Select the main folder containing Day 1, Day 2, Day 3');
+if isequal(mainFolder, 0)
+   error('No folder selected. Script stopped.');
+end
+%% ========================= USER SETTINGS ===============================
+dayFolders = {'Day 1', 'Day 2', 'Day 3'};   % change if your folders are named differently
+% Accept multiple image extensions
+imagePatterns = {'*.tif','*.tiff','*.jpg','*.jpeg','*.png'};
+outputFolder = fullfile(mainFolder, 'Analysis_Output');
+qcFolder = fullfile(outputFolder, 'QC_Overlays');
+saveQC = true;
+% Segmentation parameters
+gaussianSigma = 0.6;
+backgroundDiskRadius = 12;
+useAdaptiveThreshold = true;
+adaptiveSensitivity_live = 0.48;
+adaptiveSensitivity_dead = 0.45;
+minCellArea_live = 40;
+minCellArea_dead = 30;
+maxCellArea = Inf;
+useWatershed = true;
+excludeBorderObjects = true;
+backgroundCutoff = 0.08;
+%% ========================= CREATE OUTPUT FOLDERS =======================
+if ~exist(outputFolder, 'dir')
+   mkdir(outputFolder);
+end
+if saveQC && ~exist(qcFolder, 'dir')
+   mkdir(qcFolder);
+end
+%% ========================= INITIALIZE RESULTS ==========================
+resultsCell = {};
+%% ========================= MAIN ANALYSIS LOOP ==========================
+for d = 1:numel(dayFolders)
+   currentDayFolder = fullfile(mainFolder, dayFolders{d});
+   if ~exist(currentDayFolder, 'dir')
+       warning('Folder not found: %s', currentDayFolder);
+       continue;
+   end
+   imageFiles = [];
+   for p = 1:numel(imagePatterns)
+       imageFiles = [imageFiles; dir(fullfile(currentDayFolder, imagePatterns{p}))]; %#ok<AGROW>
+   end
+   fprintf('\n=============================================\n');
+   fprintf('Processing folder: %s\n', currentDayFolder);
+   fprintf('Number of images found: %d\n', numel(imageFiles));
+   fprintf('=============================================\n');
+   for i = 1:numel(imageFiles)
+       fileName = imageFiles(i).name;
+       filePath = fullfile(currentDayFolder, fileName);
+       fprintf('Processing image %d of %d: %s\n', i, numel(imageFiles), fileName);
+       % Read image
+I = imread(filePath);
+% If image has more than 3 channels (for example RGBA TIFF), keep only first 3
+if ndims(I) == 3 && size(I,3) > 3
+   I = I(:,:,1:3);
+end
+% Make sure it is RGB
+if ndims(I) ~= 3 || size(I,3) < 3
+   warning('Skipping %s because it is not an RGB image.', fileName);
+   continue;
+end
+       % Convert to double
+       I = im2double(I);
+       % Extract channels
+       redChan   = I(:,:,1);   % PI = dead
+       greenChan = I(:,:,2);   % Calcein AM = live
+       % Segment
+       BW_live = segmentCells(greenChan, gaussianSigma, backgroundDiskRadius, ...
+           useAdaptiveThreshold, adaptiveSensitivity_live, minCellArea_live, ...
+           maxCellArea, useWatershed, excludeBorderObjects, backgroundCutoff);
+       BW_dead = segmentCells(redChan, gaussianSigma, backgroundDiskRadius, ...
+           useAdaptiveThreshold, adaptiveSensitivity_dead, minCellArea_dead, ...
+           maxCellArea, useWatershed, excludeBorderObjects, backgroundCutoff);
+       % Optional: prevent overlapping pixels from being counted in both masks
+       overlapMask = BW_live & BW_dead;
+       BW_dead(overlapMask) = 0;
+       % Count cells
+       CC_live = bwconncomp(BW_live);
+       CC_dead = bwconncomp(BW_dead);
+       liveCount = CC_live.NumObjects;
+       deadCount = CC_dead.NumObjects;
+       totalCount = liveCount + deadCount;
+       if totalCount > 0
+           viabilityPercent = (liveCount / totalCount) * 100;
+           deadPercent = (deadCount / totalCount) * 100;
+       else
+           viabilityPercent = NaN;
+           deadPercent = NaN;
+       end
+       % Parse metadata from filename
+       [dayLabel, sampleType, sampleID, replicateLabel] = parseFilename(fileName, dayFolders{d});
+       % Store row
+       resultsCell(end+1, :) = { ...
+           string(fileName), ...
+           string(dayLabel), ...
+           string(sampleType), ...
+           string(sampleID), ...
+           string(replicateLabel), ...
+           liveCount, ...
+           deadCount, ...
+           totalCount, ...
+           viabilityPercent, ...
+           deadPercent};
+       % Save QC overlay
+       if saveQC
+           qcImage = makeQCOverlay(I, BW_live, BW_dead);
+           [~, baseName, ~] = fileparts(fileName);
+           outName = fullfile(qcFolder, [baseName '_QC.png']);
+           imwrite(qcImage, outName);
+       end
+   end
+end
+%% ========================= BUILD RESULTS TABLE =========================
+resultsTable = cell2table(resultsCell, 'VariableNames', { ...
+   'ImageName', ...
+   'Day', ...
+   'SampleType', ...
+   'SampleID', ...
+   'Replicate', ...
+   'LiveCount', ...
+   'DeadCount', ...
+   'TotalCount', ...
+   'ViabilityPercent', ...
+   'DeadPercent'});
+resultsTable = sortrows(resultsTable, {'Day', 'SampleType', 'SampleID', 'Replicate'});
+fullResultsFile = fullfile(outputFolder, 'LiveDead_Viability_AllImages.csv');
+writetable(resultsTable, fullResultsFile);
+%% ========================= SUMMARY 1: PER BIOLOGICAL SAMPLE ============
+summaryBySample = groupsummary(resultsTable, {'Day','SampleType','SampleID'}, ...
+   {'mean','std'}, {'LiveCount','DeadCount','TotalCount','ViabilityPercent','DeadPercent'});
+summaryBySampleFile = fullfile(outputFolder, 'LiveDead_Summary_BySample.csv');
+writetable(summaryBySample, summaryBySampleFile);
+%% ========================= SUMMARY 2: POOLED BY GROUP ==================
+summaryByGroup = groupsummary(resultsTable, {'Day','SampleType'}, ...
+   {'mean','std'}, {'LiveCount','DeadCount','TotalCount','ViabilityPercent','DeadPercent'});
+summaryByGroupFile = fullfile(outputFolder, 'LiveDead_Summary_ByGroup.csv');
+writetable(summaryByGroup, summaryByGroupFile);
+%% ========================= DISPLAY =====================================
+fprintf('\nAnalysis complete.\n');
+fprintf('All images results:\n%s\n', fullResultsFile);
+fprintf('Summary by sample:\n%s\n', summaryBySampleFile);
+fprintf('Summary by group:\n%s\n', summaryByGroupFile);
+disp(' ');
+disp('Full Results Table:');
+disp(resultsTable);
+disp(' ');
+disp('Summary By Sample:');
+disp(summaryBySample);
+disp(' ');
+disp('Summary By Group:');
+disp(summaryByGroup);
+%% ========================= LOCAL FUNCTIONS =============================
+function BW = segmentCells(channelImg, gaussianSigma, backgroundDiskRadius, ...
+   useAdaptiveThreshold, adaptiveSensitivity, minCellArea, ...
+   maxCellArea, useWatershed, excludeBorderObjects, backgroundCutoff)
+   imgSmooth = imgaussfilt(channelImg, gaussianSigma);
+   background = imopen(imgSmooth, strel('disk', backgroundDiskRadius));
+   imgSub = imsubtract(imgSmooth, background);
+   imgSub = mat2gray(imgSub);
+   imgSub(imgSub < backgroundCutoff) = 0;
+   if useAdaptiveThreshold
+       T = adaptthresh(imgSub, adaptiveSensitivity);
+       BW = imbinarize(imgSub, T);
+   else
+       BW = imbinarize(imgSub);
+   end
+   BW = bwareaopen(BW, minCellArea);
+   BW = imfill(BW, 'holes');
+   if excludeBorderObjects
+       BW = imclearborder(BW);
+   end
+   if useWatershed
+       D = -bwdist(~BW);
+       mask = imextendedmin(D, 1);
+       D2 = imimposemin(D, mask);
+       Ld = watershed(D2);
+       BW(Ld == 0) = 0;
+   end
+   BW = bwareaopen(BW, minCellArea);
+   if isfinite(maxCellArea)
+       CC = bwconncomp(BW);
+       stats = regionprops(CC, 'Area');
+       areas = [stats.Area];
+       keepIdx = find(areas >= minCellArea & areas <= maxCellArea);
+       BW2 = false(size(BW));
+       for k = 1:numel(keepIdx)
+           BW2(CC.PixelIdxList{keepIdx(k)}) = true;
+       end
+       BW = BW2;
+   end
+end
+function [dayLabel, sampleType, sampleID, replicateLabel] = parseFilename(fileName, folderDayName)
+   [~, baseName, ~] = fileparts(fileName);
+   cleanName = upper(strrep(baseName, '_', ' '));
+   cleanName = strrep(cleanName, 'OVERLAY', '');
+   cleanName = strtrim(cleanName);
+   dayLabel = "";
+   sampleType = "Unknown";
+   sampleID = "";
+   replicateLabel = "";
+   dayToken = regexp(cleanName, 'D[123]', 'match', 'once');
+   if ~isempty(dayToken)
+       dayLabel = string(dayToken);
+   else
+       if contains(folderDayName, '1')
+           dayLabel = "D1";
+       elseif contains(folderDayName, '2')
+           dayLabel = "D2";
+       elseif contains(folderDayName, '3')
+           dayLabel = "D3";
+       else
+           dayLabel = string(folderDayName);
+       end
+   end
+   sampleToken = regexp(cleanName, '(PM|PF|HM|HF)\d+', 'match', 'once');
+   if ~isempty(sampleToken)
+       prefix = regexp(sampleToken, '(PM|PF|HM|HF)', 'match', 'once');
+       number = regexp(sampleToken, '\d+', 'match', 'once');
+       switch prefix
+           case 'PM'
+               sampleType = "Pig Male dECM";
+           case 'PF'
+               sampleType = "Pig Female dECM";
+           case 'HM'
+               sampleType = "Human Male dECM";
+           case 'HF'
+               sampleType = "Human Female dECM";
+       end
+       sampleID = string([prefix number]);
+   end
+   repToken = regexp(cleanName, 'R\d+', 'match', 'once');
+   if ~isempty(repToken)
+       replicateLabel = string(repToken);
+   else
+       replicateLabel = "";
+   end
+end
+function qcImage = makeQCOverlay(originalRGB, BW_live, BW_dead)
+   if size(originalRGB,3) > 3
+       originalRGB = originalRGB(:,:,1:3);
+   end
+   base = im2uint8(originalRGB);
+   if ndims(base) ~= 3 || size(base,3) ~= 3
+       error('QC image is not RGB after conversion.');
+   end
+   qcImage = base;
+   livePerim = bwperim(BW_live);
+   deadPerim = bwperim(BW_dead);
+   redPlane = qcImage(:,:,1);
+   greenPlane = qcImage(:,:,2);
+   bluePlane = qcImage(:,:,3);
+   greenPlane(livePerim) = 255;
+   redPlane(deadPerim) = 255;
+   bluePlane(livePerim | deadPerim) = 0;
+   qcImage(:,:,1) = redPlane;
+   qcImage(:,:,2) = greenPlane;
+   qcImage(:,:,3) = bluePlane;
+end
